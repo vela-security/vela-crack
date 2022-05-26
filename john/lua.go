@@ -34,7 +34,7 @@ var xEnv assert.Environment
 
 func NewLuaCrackJohn(L *lua.LState) int {
 	cfg := newConfig(L)
-	proc := L.NewProc(cfg.name, fileTypeOf)
+	proc := L.NewProc(cfg.name, typeof)
 	if proc.IsNil() {
 		proc.Set(newJohn(cfg))
 

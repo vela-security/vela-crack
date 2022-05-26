@@ -4,6 +4,8 @@ import (
 	audit "github.com/vela-security/vela-audit"
 	"github.com/vela-security/vela-public/lua"
 	"github.com/vela-security/vela-public/pipe"
+	"github.com/vela-security/vela-public/worker"
+	tomb2 "gopkg.in/tomb.v2"
 )
 
 func (j *john) onMatch(h happy) {
@@ -18,31 +20,85 @@ func (j *john) pipe(L *lua.LState) int {
 }
 
 func (j *john) shadowL(L *lua.LState) int {
-	j.attack(SHADOW, L.IsString(1))
+	tomb := new(tomb2.Tomb)
+	raw := L.IsString(1)
+	if raw == "" {
+		return 0
+	}
+
+	worker.New(L, j.Name()+".worker").Env(xEnv).
+		Task(func() { j.shadow(raw, tomb) }).
+		Kill(func() { tomb.Kill(nil) }).
+		Start()
 	return 0
 }
 func (j *john) md5L(L *lua.LState) int {
-	j.attack(MD5, L.IsString(1))
+	tomb := new(tomb2.Tomb)
+	raw := L.IsString(1)
+	if raw == "" {
+		return 0
+	}
+
+	worker.New(L, j.Name()+".worker").Env(xEnv).
+		Task(func() { j.md5(raw, tomb) }).
+		Kill(func() { tomb.Kill(nil) }).
+		Start()
 	return 0
 }
 
 func (j *john) sha256L(L *lua.LState) int {
-	j.attack(SHA256, L.IsString(1))
+	tomb := new(tomb2.Tomb)
+	raw := L.IsString(1)
+	if raw == "" {
+		return 0
+	}
+
+	worker.New(L, j.Name()+".worker").Env(xEnv).
+		Task(func() { j.sha256(raw, tomb) }).
+		Kill(func() { tomb.Kill(nil) }).
+		Start()
 	return 0
 }
 
 func (j *john) sha512L(L *lua.LState) int {
-	j.attack(SHA256, L.IsString(1))
+	tomb := new(tomb2.Tomb)
+	raw := L.IsString(1)
+	if raw == "" {
+		return 0
+	}
+
+	worker.New(L, j.Name()+".worker").Env(xEnv).
+		Task(func() { j.sha512(raw, tomb) }).
+		Kill(func() { tomb.Kill(nil) }).
+		Start()
 	return 0
 }
 
 func (j *john) rainbowL(L *lua.LState) int {
-	j.attack(RAINBOW, L.IsString(1))
+	tomb := new(tomb2.Tomb)
+	raw := L.IsString(1)
+	if raw == "" {
+		return 0
+	}
+
+	worker.New(L, j.Name()+".worker").Env(xEnv).
+		Task(func() { j.rainbow(raw, tomb) }).
+		Kill(func() { tomb.Kill(nil) }).
+		Start()
 	return 0
 }
 
 func (j *john) equalL(L *lua.LState) int {
-	j.attack(EQUAL, L.IsString(1))
+	tomb := new(tomb2.Tomb)
+	raw := L.IsString(1)
+	if raw == "" {
+		return 0
+	}
+
+	worker.New(L, j.Name()+".worker").Env(xEnv).
+		Task(func() { j.equal(raw, tomb) }).
+		Kill(func() { tomb.Kill(nil) }).
+		Start()
 	return 0
 }
 

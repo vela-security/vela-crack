@@ -5,13 +5,16 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"github.com/tredoe/osutil/user/crypt"
 	"github.com/tredoe/osutil/user/crypt/md5_crypt"
 	"github.com/tredoe/osutil/user/crypt/sha256_crypt"
 	"github.com/tredoe/osutil/user/crypt/sha512_crypt"
+	audit "github.com/vela-security/vela-audit"
 	"github.com/vela-security/vela-chameleon/vitess/go/vt/log"
 	"github.com/vela-security/vela-public/lua"
+	tomb2 "gopkg.in/tomb.v2"
 	"hash"
 	"reflect"
 	"strconv"
@@ -28,7 +31,7 @@ const (
 	SHADOW
 )
 
-var fileTypeOf = reflect.TypeOf((*john)(nil)).String()
+var typeof = reflect.TypeOf((*john)(nil)).String()
 
 type john struct {
 	lua.ProcEx
@@ -39,6 +42,14 @@ func newJohn(cfg *config) *john {
 	obj := &john{cfg: cfg}
 	obj.V(lua.PTInit, time.Now())
 	return obj
+}
+
+func (j *john) Name() string {
+	return j.cfg.name
+}
+
+func (j *john) Type() string {
+	return typeof
 }
 
 func (j *john) Start() error {
@@ -69,7 +80,7 @@ func (j *john) compareVM(co1 *lua.LState, co2 *lua.LState) bool {
 	return vm1 == vm2
 }
 
-func (j *john) shadow(raw string) {
+func (j *john) shadow(raw string, tomb *tomb2.Tomb) {
 	//1. 首先解析shadow raw 字符串
 	//2. 开始爆破
 	//3. 命中后运行pipe中的逻辑
@@ -113,7 +124,7 @@ func (j *john) shadow(raw string) {
 	hashedpass := passhash[1]
 
 	//将密码字典进行加密并比较
-	err, ok, plain := j.Shadow(cryp, hashedpass, salt)
+	err, ok, plain := j.Shadow(cryp, hashedpass, salt, tomb)
 	if err != nil {
 		log.Errorf("checkshadow err : ", err)
 		xEnv.Infof("shadow parse fail %v", err)
@@ -133,7 +144,7 @@ func (j *john) shadow(raw string) {
 	})
 }
 
-func (j *john) Shadow(crypt crypt.Crypter, hashedpass string, salt string) (error, bool, string) {
+func (j *john) Shadow(crypt crypt.Crypter, hashedpass string, salt string, tomb *tomb2.Tomb) (error, bool, string) {
 
 	if j.cfg.dict == nil {
 		return fmt.Errorf("not found dictionary"), false, ""
@@ -142,26 +153,38 @@ func (j *john) Shadow(crypt crypt.Crypter, hashedpass string, salt string) (erro
 	scan := j.cfg.dict.Scanner()
 	sa := lua.S2B(salt)
 
-	for scan.Next() {
-		raw := scan.Text()
-		ph, err := crypt.Generate(lua.S2B(raw), sa)
-		if err != nil {
-			xEnv.Errorf("crypt %s fail %v", raw, err)
-			continue
-		}
+	for {
+		select {
 
-		if ph != hashedpass {
-			continue
-		}
+		case <-tomb.Dying():
+			audit.Errorf("%s crack attack over.", j.Name()).From(j.CodeVM()).Put()
 
-		scan.Done()
-		return nil, true, raw
+		default:
+			if !scan.Next() {
+				tomb.Kill(errors.New("over"))
+				return nil, false, ""
+			}
+
+			raw := scan.Text()
+			ph, err := crypt.Generate(lua.S2B(raw), sa)
+			if err != nil {
+				xEnv.Errorf("crypt %s fail %v", raw, err)
+				continue
+			}
+
+			if ph != hashedpass {
+				continue
+			}
+
+			scan.Done()
+			return nil, true, raw
+		}
 	}
 
 	return nil, false, ""
 }
 
-func (j *john) Crypt(h hash.Hash, raw string) (bool, string) {
+func (j *john) Crypt(h hash.Hash, raw string, tomb *tomb2.Tomb) (bool, string) {
 	if j.cfg.dict == nil {
 		return false, ""
 	}
@@ -169,43 +192,42 @@ func (j *john) Crypt(h hash.Hash, raw string) (bool, string) {
 	scan := j.cfg.dict.Scanner()
 	salt := lua.S2B(j.cfg.salt)
 
-	for scan.Next() {
-		text := lua.S2B(scan.Text())
-		text = append(text, salt...)
+	for {
+		select {
 
-		_, err := h.Write(text)
-		if err != nil {
-			xEnv.Errorf("crypt %s fail %v", raw, err)
-			continue
-		}
+		case <-tomb.Dying():
+			audit.Errorf("%s crack attack over.", j.Name()).From(j.CodeVM()).Put()
 
-		if hex.EncodeToString(h.Sum(nil)) == raw {
-			scan.Done()
-			return true, lua.B2S(text)
+		default:
+
+			if !scan.Next() {
+				return false, ""
+			}
+
+			text := lua.S2B(scan.Text())
+			text = append(text, salt...)
+
+			_, err := h.Write(text)
+			if err != nil {
+				xEnv.Errorf("crypt %s fail %v", raw, err)
+				continue
+			}
+
+			if hex.EncodeToString(h.Sum(nil)) == raw {
+				scan.Done()
+				return true, lua.B2S(text)
+			}
+			h.Reset()
+
 		}
-		h.Reset()
 	}
 
 	return false, ""
 }
 
-func (j *john) checkcryptstr(h hash.Hash, src string, raw string) (bool, string) {
-	salt := j.cfg.salt
-	h.Write([]byte(src))
-	if len(salt) != 0 {
-		h.Write([]byte(salt))
-	}
-	if fmt.Sprintf("%x", h.Sum(nil)) == raw {
-		h.Reset()
-		return true, src
-	}
-	h.Reset()
-	return false, ""
-}
-
-func (j *john) md5(raw string) { //raw : eeda50edb56d...
+func (j *john) md5(raw string, tomb *tomb2.Tomb) { //raw : eeda50edb56d...
 	h := md5.New()
-	ok, plain := j.Crypt(h, raw)
+	ok, plain := j.Crypt(h, raw, tomb)
 	if !ok {
 		return
 	}
@@ -217,9 +239,9 @@ func (j *john) md5(raw string) { //raw : eeda50edb56d...
 	})
 }
 
-func (j *john) sha256(raw string) {
+func (j *john) sha256(raw string, tomb *tomb2.Tomb) {
 	h := sha256.New()
-	ok, plain := j.Crypt(h, raw)
+	ok, plain := j.Crypt(h, raw, tomb)
 	if !ok {
 		return
 	}
@@ -231,9 +253,9 @@ func (j *john) sha256(raw string) {
 	})
 }
 
-func (j *john) sha512(raw string) {
+func (j *john) sha512(raw string, tomb *tomb2.Tomb) {
 	h := sha512.New()
-	ok, plain := j.Crypt(h, raw)
+	ok, plain := j.Crypt(h, raw, tomb)
 	if !ok {
 		return
 	}
@@ -245,17 +267,29 @@ func (j *john) sha512(raw string) {
 	})
 }
 
-func (j *john) rainbow(raw string) {
+func (j *john) rainbow(raw string, tomb *tomb2.Tomb) {
 	if j.cfg.dict == nil {
 		return
 	}
 
 	scan := j.cfg.dict.Scanner()
+	for {
+		select {
+		case <-tomb.Dying():
+			return
 
-	for scan.Next() {
-		text := scan.Text()
-		hash, plain := rainbowDictParse(text)
-		if hash == raw {
+		default:
+			if !scan.Next() {
+				tomb.Kill(errors.New("over"))
+				return
+			}
+
+			text := scan.Text()
+			hash, plain := rainbowDictParse(text)
+			if hash != raw {
+				continue
+			}
+
 			scan.Done()
 			j.onMatch(happy{
 				method: "rainbow",
@@ -263,19 +297,34 @@ func (j *john) rainbow(raw string) {
 				cipher: raw,
 			})
 			return
+
 		}
 	}
+
 }
 
-func (j *john) equal(raw string) {
+func (j *john) equal(raw string, tomb *tomb2.Tomb) {
 	if j.cfg.dict == nil {
 		return
 	}
 
 	scan := j.cfg.dict.Scanner()
-	for scan.Next() {
-		text := scan.Text()
-		if text == raw {
+	for {
+		select {
+		case <-tomb.Dying():
+			return
+
+		default:
+			if !scan.Next() {
+				tomb.Kill(errors.New("over"))
+				return
+			}
+
+			text := scan.Text()
+			if text != raw {
+				continue
+			}
+
 			scan.Done()
 			j.onMatch(happy{
 				method: "equal",
@@ -284,6 +333,7 @@ func (j *john) equal(raw string) {
 			})
 			return
 		}
+
 	}
 }
 
@@ -294,26 +344,28 @@ func (j *john) dict(L *lua.LState) int {
 	return j.ret(L)
 }
 
-func (j *john) attack(method uint8, raw string) {
-	if raw == "" {
-		return
-	}
-
-	//hash方式  $pass$salt
-	switch method {
-	case MD5:
-		j.md5(raw)
-	case SHA256:
-		j.sha256(raw)
-	case SHA512:
-		j.sha512(raw)
-	case SHADOW:
-		j.shadow(raw)
-
-	case EQUAL:
-		j.equal(raw)
-
-	case RAINBOW:
-		j.rainbow(raw)
-	}
-}
+//func (j *john) attack(method uint8, raw string) {
+//	if raw == "" {
+//		return
+//	}
+//
+//	wk := worker.New(L, j.Name()+".worker")
+//
+//	//hash方式  $pass$salt
+//	switch method {
+//	case MD5:
+//		j.md5(raw, tomb)
+//	case SHA256:
+//		j.sha256(raw, tomb)
+//	case SHA512:
+//		j.sha512(raw, tomb)
+//	case SHADOW:
+//		j.shadow(raw, tomb)
+//
+//	case EQUAL:
+//		j.equal(raw, tomb)
+//
+//	case RAINBOW:
+//		j.rainbow(raw, tomb)
+//	}
+//}
